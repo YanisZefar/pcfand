@@ -4,6 +4,27 @@ The X format is the in-memory LongStr representation written by EXPIMP.PAS:
 - uint16 little-endian length at offset 0
 - encoded payload and random displacement padding
 - time byte and XOR-masked displacement trailer
+
+IMPORTANT - password-protected ("nevratně zaheslovaná") applications:
+    In PC FAND the password is only an access gate. It is stored separately in
+    PwCode/Pw2Code (XOR 0xAA) and verified at runtime via HasPassword, but it
+    NEVER enters the encoding transform of the source text records.
+
+    The actual encoding depends only on the build path in CodingCRdb (EXPIMP.PAS):
+      * Rotate=false  -> "zaheslovaná" (password only) build
+                         source texts encoded with Code() = plain XOR 0xAA
+                         => use  --format xor-aa
+      * Rotate=true   -> licensed/rotated build (AltF10)
+                         source texts encoded with XEncode (compressed LongStr)
+                         => use  --format x
+
+    Because the password is not a cryptographic key, a "nevratně zaheslovaná"
+    application is fully recoverable: decode it with --format xor-aa (the
+    stored password in PwCode is itself XOR 0xAA and is recovered too).
+
+Examples:
+    python3 xdecode.py app.rdb out.txt --format xor-aa
+    python3 xdecode.py app.rdb out.txt --format x --mode full
 """
 
 from __future__ import annotations
@@ -95,18 +116,66 @@ def decode_x_segment(segment: bytes) -> bytes:
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="encoded segment file")
+    parser.add_argument("input", type=Path, help="encoded file (segment or full file)")
     parser.add_argument("output", type=Path, help="decoded output file")
     parser.add_argument(
         "--format",
         choices=("x", "xor-aa"),
         default="x",
-        help="input format (default: x)",
+        help=(
+            "input format for each segment (default: x). "
+            "'x' decodes the XEncode compressed LongStr used by licensed/rotated "
+            "builds (CodingCRdb with Rotate=true). "
+            "'xor-aa' reverses the plain XOR 0xAA Code() transform used by "
+            "password-protected ('nevratně zaheslovaná') builds "
+            "(CodingCRdb with Rotate=false)"
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("segment", "full"),
+        default="segment",
+        help=(
+            "decoding mode (default: segment). "
+            "'segment' treats the whole input file as one encoded LongStr segment "
+            "and decodes it at once. "
+            "'full' scans the file sequentially, decoding every consecutive "
+            "LongStr segment (2-byte little-endian length header) one by one; "
+            "segments that fail to decode are kept as raw bytes and the results "
+            "are joined with a newline"
+        ),
     )
     args = parser.parse_args()
 
-    encoded = args.input.read_bytes()
-    decoded = decode_x_segment(encoded) if args.format == "x" else decode_xor_aa(encoded)
+    data = args.input.read_bytes()
+    if args.mode == "segment":
+        # Treat the entire file as a single encoded segment
+        decoded = decode_x_segment(data) if args.format == "x" else decode_xor_aa(data)
+    else:
+        # Full scan: decode each LongStr segment in sequence
+        decoded_parts = []
+        offset = 0
+        total_len = len(data)
+        while offset + 2 <= total_len:
+            # Read the declared length of the next segment
+            seg_len = struct.unpack_from("<H", data, offset)[0]
+            seg_end = offset + seg_len + 2  # include the 2-byte length field
+            if seg_end > total_len:
+                # Not enough data left; treat the rest as raw and break
+                decoded_parts.append(data[offset:])
+                break
+            segment = data[offset:seg_end]
+            try:
+                decoded_seg = decode_x_segment(segment) if args.format == "x" else decode_xor_aa(segment)
+                decoded_parts.append(decoded_seg)
+            except DecodeError:
+                # If decoding fails, fall back to raw bytes for this segment
+                decoded_parts.append(segment)
+            offset = seg_end
+        # Append any leftover bytes that don't start a segment
+        if offset < total_len:
+            decoded_parts.append(data[offset:])
+        decoded = b"\n".join(decoded_parts)
     args.output.write_bytes(decoded)
     return 0
 
