@@ -145,10 +145,149 @@ def _main() -> int:
             "are joined with a newline"
         ),
     )
+def _reassemble_tfile_record(data: bytes, pos: int) -> "bytes | None":
+    """Reconstruct one LongStr stored in a TFile (T00Format) page container.
+
+    Mirrors ``TFile.Read`` in FAND's FILEACC.PAS: records are kept in 512-byte
+    pages; a record longer than the space left on a page is chained to the next
+    page via a 4-byte little-endian page pointer (see ``TFile.RdWr``).
+    """
+    mpage = 512
+    maxl = 65000
+    if pos < mpage or pos >= len(data):
+        return None
+    length = struct.unpack_from("<H", data, pos)[0]
+    if length == 0 or length > maxl + 1:
+        return None
+    if length == maxl + 1:
+        length = maxl
+    out = bytearray()
+    p = pos + 2
+    remaining = length
+    while remaining > 0:
+        rest = mpage - (p & (mpage - 1))
+        if remaining > rest - 4:
+            chunk = rest - 4
+            out += data[p:p + chunk]
+            remaining -= chunk
+            p += chunk
+            if p + 4 > len(data):
+                return None
+            nxt = struct.unpack_from("<I", data, p)[0]
+            p = nxt
+            if p < mpage or p >= len(data):
+                return None
+        else:
+            out += data[p:p + remaining]
+            remaining = 0
+    return bytes(out)
+
+
+def _looks_like_text(b: bytes) -> bool:
+    """Accept a candidate only if it is plausibly FAND source text.
+
+    Real source mixes ASCII keywords/operators with Kamenicky-encoded Czech
+    letters (0x80-0xFF). We require a high ratio of printable ASCII *and* at
+    least one run of 4+ ASCII letters, which random/garbage data rarely meets.
+    """
+    if len(b) < 10:
+        return False
+    ascii_frac = sum(1 for x in b if 0x20 <= x <= 0x7E) / len(b)
+    if ascii_frac < 0.45:
+        return False
+    run = 0
+    for x in b:
+        if 0x41 <= x <= 0x5A or 0x61 <= x <= 0x7A:
+            run += 1
+            if run >= 4:
+                return True
+        else:
+            run = 0
+    return False
+
+
+def decode_tfile(data: bytes) -> bytes:
+    """Decode every text record stored inside a FAND TFile container.
+
+    Scans all candidate record starts, reassembles each LongStr across pages,
+    then reverses both the XEncode (``--format x``) and XOR-AA (``--format
+    xor-aa``) transforms, keeping whatever yields readable FAND source text.
+    """
+    out = bytearray()
+    seen = set()
+    for pos in range(512, len(data) - 4):
+        length = struct.unpack_from("<H", data, pos)[0]
+        if length < 6 or length > 9000:
+            continue
+        raw = _reassemble_tfile_record(data, pos)
+        if raw is None or len(raw) < 6:
+            continue
+        candidates = []
+        if args_format_is_x:
+            try:
+                candidates.append(decode_x_segment(struct.pack("<H", length) + raw))
+            except DecodeError:
+                pass
+        if args_format_is_xor_aa:
+            candidates.append(decode_xor_aa(raw))
+        for dec in candidates:
+            if _looks_like_text(dec) and dec not in seen:
+                seen.add(dec)
+                out += dec
+                out += b"\n"
+    return bytes(out)
+
+
+args_format_is_x = False
+args_format_is_xor_aa = False
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path, help="encoded file (segment or full file)")
+    parser.add_argument("output", type=Path, help="decoded output file")
+    parser.add_argument(
+        "--format",
+        choices=("x", "xor-aa", "both"),
+        default="both",
+        help=(
+            "input format for each segment (default: both). "
+            "'x' decodes the XEncode compressed LongStr used by licensed/rotated "
+            "builds (CodingCRdb with Rotate=true). "
+            "'xor-aa' reverses the plain XOR 0xAA Code() transform used by "
+            "password-protected ('nevratně zaheslovaná') builds "
+            "(CodingCRdb with Rotate=false). "
+            "'both' tries each record with both transforms and keeps the one that "
+            "yields readable text (used with --mode tfile)"
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("segment", "full", "tfile"),
+        default="segment",
+        help=(
+            "decoding mode (default: segment). "
+            "'segment' treats the whole input file as one encoded LongStr segment "
+            "and decodes it at once. "
+            "'full' scans the file sequentially, decoding every consecutive "
+            "LongStr segment (2-byte little-endian length header) one by one; "
+            "segments that fail to decode are kept as raw bytes and the results "
+            "are joined with a newline. "
+            "'tfile' treats the input as a FAND TFile container (512-byte pages): "
+            "it reassembles each LongStr record across pages and decodes it with "
+            "the XEncode and/or XOR 0xAA transforms, keeping readable source text"
+        ),
+    )
     args = parser.parse_args()
 
+    global args_format_is_x, args_format_is_xor_aa
+    args_format_is_x = args.format in ("x", "both")
+    args_format_is_xor_aa = args.format in ("xor-aa", "both")
+
     data = args.input.read_bytes()
-    if args.mode == "segment":
+    if args.mode == "tfile":
+        decoded = decode_tfile(data)
+    elif args.mode == "segment":
         # Treat the entire file as a single encoded segment
         decoded = decode_x_segment(data) if args.format == "x" else decode_xor_aa(data)
     else:
@@ -165,10 +304,17 @@ def _main() -> int:
                 decoded_parts.append(data[offset:])
                 break
             segment = data[offset:seg_end]
+            decoded_seg = None
             try:
-                decoded_seg = decode_x_segment(segment) if args.format == "x" else decode_xor_aa(segment)
-                decoded_parts.append(decoded_seg)
+                if args_format_is_x:
+                    decoded_seg = decode_x_segment(segment)
+                if decoded_seg is None and args_format_is_xor_aa:
+                    decoded_seg = decode_xor_aa(segment)
             except DecodeError:
+                decoded_seg = None
+            if decoded_seg is not None:
+                decoded_parts.append(decoded_seg)
+            else:
                 # If decoding fails, fall back to raw bytes for this segment
                 decoded_parts.append(segment)
             offset = seg_end
