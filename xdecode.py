@@ -103,9 +103,12 @@ def decode_x_segment(segment: bytes) -> bytes:
         else:
             if source >= payload_end:
                 raise DecodeError("truncated literal token")
+            # Mirror EXPIMP.PAS XEncode literal loop exactly:
+            #     lodsb; rol RMask,1; xor al,RMask; stosb
+            # i.e. rotate the mask BEFORE XOR-ing the byte with it.
+            mask = _rol8(mask, 1)
             output.append(segment[source] ^ mask)
             source += 1
-            mask = _rol8(mask, 1)
 
         flag_mask <<= 1
         if flag_mask > 0x80:
@@ -114,37 +117,6 @@ def decode_x_segment(segment: bytes) -> bytes:
     return bytes(output[2:])
 
 
-def _main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="encoded file (segment or full file)")
-    parser.add_argument("output", type=Path, help="decoded output file")
-    parser.add_argument(
-        "--format",
-        choices=("x", "xor-aa"),
-        default="x",
-        help=(
-            "input format for each segment (default: x). "
-            "'x' decodes the XEncode compressed LongStr used by licensed/rotated "
-            "builds (CodingCRdb with Rotate=true). "
-            "'xor-aa' reverses the plain XOR 0xAA Code() transform used by "
-            "password-protected ('nevratně zaheslovaná') builds "
-            "(CodingCRdb with Rotate=false)"
-        ),
-    )
-    parser.add_argument(
-        "--mode",
-        choices=("segment", "full"),
-        default="segment",
-        help=(
-            "decoding mode (default: segment). "
-            "'segment' treats the whole input file as one encoded LongStr segment "
-            "and decodes it at once. "
-            "'full' scans the file sequentially, decoding every consecutive "
-            "LongStr segment (2-byte little-endian length header) one by one; "
-            "segments that fail to decode are kept as raw bytes and the results "
-            "are joined with a newline"
-        ),
-    )
 def _reassemble_tfile_record(data: bytes, pos: int) -> "bytes | None":
     """Reconstruct one LongStr stored in a TFile (T00Format) page container.
 
