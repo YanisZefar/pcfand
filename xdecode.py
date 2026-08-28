@@ -164,6 +164,10 @@ def _looks_like_text(b: bytes) -> bool:
     """
     if len(b) < 10:
         return False
+    if 0 in b:
+        # Embedded NULs mark internal sub-structures (record names, pointers),
+        # never FAND source text.
+        return False
     ascii_frac = sum(1 for x in b if 0x20 <= x <= 0x7E) / len(b)
     if ascii_frac < 0.45:
         return False
@@ -182,8 +186,11 @@ def decode_tfile(data: bytes) -> bytes:
     """Decode every text record stored inside a FAND TFile container.
 
     Scans all candidate record starts, reassembles each LongStr across pages,
-    then reverses both the XEncode (``--format x``) and XOR-AA (``--format
-    xor-aa``) transforms, keeping whatever yields readable FAND source text.
+    then reverses the XEncode (``--format x``) and XOR-AA (``--format
+    xor-aa``) transforms, and also tries the record verbatim. FAND TFfiles may
+    mix all three representations per record (a plaintext "Položka :A,10;"
+    field stored unencoded next to an XEncode- or XOR-AA-compressed record),
+    so whatever yields readable FAND source text is kept.
     """
     out = bytearray()
     seen = set()
@@ -202,12 +209,36 @@ def decode_tfile(data: bytes) -> bytes:
                 pass
         if args_format_is_xor_aa:
             candidates.append(decode_xor_aa(raw))
+        # Records may also be stored unencoded (plaintext)
+        candidates.append(raw)
         for dec in candidates:
             if _looks_like_text(dec) and dec not in seen:
                 seen.add(dec)
                 out += dec
                 out += b"\n"
     return bytes(out)
+
+
+def _decode_segment_best(segment: bytes) -> "bytes | None":
+    """Try XEncode, then XOR-AA, then verbatim; return the first that reads as text.
+
+    Some FAND exports store a segment unencoded (plaintext). Returning the raw
+    bytes when they already look like source text recovers those segments
+    instead of discarding them.
+    """
+    candidates = []
+    if args_format_is_x:
+        try:
+            candidates.append(decode_x_segment(segment))
+        except DecodeError:
+            pass
+    if args_format_is_xor_aa:
+        candidates.append(decode_xor_aa(segment))
+    candidates.append(segment)
+    for cand in candidates:
+        if _looks_like_text(cand):
+            return cand
+    return None
 
 
 args_format_is_x = False
@@ -260,8 +291,10 @@ def _main() -> int:
     if args.mode == "tfile":
         decoded = decode_tfile(data)
     elif args.mode == "segment":
-        # Treat the entire file as a single encoded segment
-        decoded = decode_x_segment(data) if args.format == "x" else decode_xor_aa(data)
+        # Treat the entire file as a single encoded segment; fall back to raw
+        decoded = _decode_segment_best(data)
+        if decoded is None:
+            decoded = data
     else:
         # Full scan: decode each LongStr segment in sequence
         decoded_parts = []
@@ -276,14 +309,7 @@ def _main() -> int:
                 decoded_parts.append(data[offset:])
                 break
             segment = data[offset:seg_end]
-            decoded_seg = None
-            try:
-                if args_format_is_x:
-                    decoded_seg = decode_x_segment(segment)
-                if decoded_seg is None and args_format_is_xor_aa:
-                    decoded_seg = decode_xor_aa(segment)
-            except DecodeError:
-                decoded_seg = None
+            decoded_seg = _decode_segment_best(segment)
             if decoded_seg is not None:
                 decoded_parts.append(decoded_seg)
             else:
