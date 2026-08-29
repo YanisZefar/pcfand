@@ -116,3 +116,4 @@ __pycache__/
 # generated decoded outputs
 aplikace_pcfand/decoded_full/*.txt
 aplikace_pcfand/fand_unlock_out/decoded/
+aplikace_pcfand/fand_unlock_out/*.csv

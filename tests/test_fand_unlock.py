@@ -185,5 +185,27 @@ class TestSchemaKey(unittest.TestCase):
         self.assertEqual(F._schema_key("EEDATA"), "eedata")
 
 
+class TestMemoDecode(unittest.TestCase):
+    def test_readable_score(self):
+        self.assertEqual(F._readable_score(""), 0.0)
+        self.assertGreater(F._readable_score("Hlavní budova v KSK."), 0.8)
+        self.assertLess(F._readable_score("ÔĂ╦▄─\x0bŐ"), 0.6)
+
+    def test_decode_memo_plaintext(self):
+        raw = " firma KOBRA".encode(F.CP852) + b"\x00\x00"
+        self.assertEqual(F._decode_memo_blob(raw), " firma KOBRA")
+
+    def test_decode_memo_xoraa(self):
+        # FAND 'Code': memo ulozena jako XOR 0xAA (LicNr sablony == 0)
+        plain = "Hlavní budova v KSK.".encode(F.CP852)
+        raw = F.xorAA(plain) + b"\xaa"  # 0xAA je XOR nuly -> terminator
+        self.assertEqual(F._decode_memo_blob(raw), "Hlavní budova v KSK.")
+
+    def test_decode_memo_empty(self):
+        # XOR 0xAA mezery -> prazdny memo
+        raw = b"\x8a\x8a\x8a\x8a"
+        self.assertIsNone(F._decode_memo_blob(raw))
+
+
 if __name__ == "__main__":
     unittest.main()

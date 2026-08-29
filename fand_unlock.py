@@ -342,6 +342,134 @@ def _decode_D(b, file_type):
     return ""
 
 
+def _rol8(v, n):
+    """Rotate an 8-bit value left by n bits (matches x86 ROL al,cl)."""
+    n &= 7
+    return ((v << n) | (v >> (8 - n))) & 0xFF
+
+
+def _xdecode_longstr(data):
+    """Decompress a FAND LongStr encoded by ``XDecode`` (ACCESS.PAS:903).
+
+    Layout of the encoded LongStr on disk::
+
+        [0:2]   L          word  - length of the (decoded) data region
+        [2:L]   data       L bytes - skipped header + the encoded stream; the
+                           last byte (offset L-1) seeds the RMask rotation
+        [L:L+2] Displ      word  - (value XOR 0x0CCC); offset (from 2) where
+                           the encoded bit-stream starts
+
+    The bit-stream is an LZ77 variant: each control bit selects a literal byte
+    (XORed with a rotating mask) or a back-reference copy of already decoded
+    bytes. Used for memo ('T') fields of licensed templates (LicenseNr != 0).
+    """
+    if len(data) < 2:
+        return b""
+    L = int.from_bytes(data[0:2], "little")
+    if L == 0:
+        return b""
+    buf = bytes(data)
+    bx = L
+    if L + 2 > len(buf):
+        return b""
+    displ = int.from_bytes(buf[L:L + 2], "little") ^ 0x0CCC
+    si = 2 + displ
+    if bx - 1 < 0:
+        return b""
+    RMask = _rol8(0x9C, buf[bx - 1] & 3)
+    out = bytearray()
+    dh = 0xFF
+    dl = 0
+
+    def _load_ctrl():
+        nonlocal si, dh, dl
+        b = buf[si]
+        si += 1
+        dh = 0xFF
+        dl = b
+
+    if si >= len(buf):
+        return b""
+    _load_ctrl()
+    while True:
+        if si >= bx:
+            break
+        if (dh & 1) == 0:
+            if si >= len(buf):
+                break
+            _load_ctrl()
+            continue
+        if dl & 1:
+            # repeat: copy 'count' bytes from back-reference at offset 'off'
+            if si >= len(buf):
+                break
+            count = buf[si]
+            si += 1
+            if si + 2 > len(buf):
+                break
+            off = int.from_bytes(buf[si:si + 2], "little")
+            si += 2
+            if off < 0 or off + count > len(buf):
+                break
+            for _ in range(count):
+                out.append(buf[off])
+                off += 1
+        else:
+            # literal: XOR the next byte with the rotating mask
+            if si >= len(buf):
+                break
+            b = buf[si]
+            si += 1
+            RMask = _rol8(RMask, 1)
+            out.append(b ^ RMask)
+        dx = (dh << 8) | dl
+        dx >>= 1
+        dh = (dx >> 8) & 0xFF
+        dl = dx & 0xFF
+    return bytes(out)
+
+
+def _readable_score(s):
+    if not s:
+        return 0.0
+    ok = 0
+    for c in s:
+        o = ord(c)
+        if c in ("\n", "\r", "\t") or 0x20 <= o <= 0x7E or 0x80 <= o <= 0xFF:
+            ok += 1
+    return ok / len(s)
+
+
+def _decode_memo_blob(raw):
+    """Decode a memo (.T00) blob.
+
+    FAND uklada textova pole dvojice zpusobu (viz ACCESS.PAS):
+      * ``Code``  - prosty XOR 0xAA (pouziva se pro 'A' i 'T', kdyz
+                     LicenseNr sablony == 0);
+      * ``XDecode`` - LZ77 s rotujici maskou (pouziva se pro 'T', kdyz
+                     LicenseNr sablony != 0).
+    Nektere tabulky navic ukladaji memo cisty plaintext (bez kodovani).
+    Zkousime v poradi plaintext -> XOR 0xAA -> XDecode a vracime tu
+    variantu, ktera da nejvice citelnych znaku."""
+    # 1) plaintext (null-terminated CP852)
+    s = raw.split(b"\x00", 1)[0].decode(CP852, "replace")
+    if _readable_score(s.rstrip()) >= 0.6:
+        return s.rstrip()
+    # 2) XOR 0xAA (FAND 'Code')
+    x = xorAA(raw).split(b"\x00", 1)[0].decode(CP852, "replace")
+    if _readable_score(x.rstrip()) >= 0.6:
+        return x.rstrip()
+    # 3) XDecode (FAND 'XDecode' pro LicenseNr != 0)
+    try:
+        xd = _xdecode_longstr(raw)
+        s3 = xd.split(b"\x00", 1)[0].decode(CP852, "replace")
+        if _readable_score(s3.rstrip()) >= 0.6:
+            return s3.rstrip()
+    except Exception:
+        pass
+    return None
+
+
 def _read_t00(t00, phys):
     if t00 is None:
         return None
@@ -350,10 +478,7 @@ def _read_t00(t00, phys):
     raw = xdecode._reassemble_tfile_record(t00, phys)
     if not raw:
         return None
-    s = raw.split(b"\x00")[0].decode(CP852, "replace").rstrip()
-    if not s or not any(0x20 <= ord(c) <= 0x7E or 0x80 <= ord(c) <= 0xFF for c in s):
-        return None
-    return s
+    return _decode_memo_blob(raw)
 
 
 def _decode_T(pb, t00):
