@@ -68,3 +68,44 @@ def test_plaintext_record_in_tfile():
 def test_looks_like_text_rejects_embedded_nul():
     assert X._looks_like_text(b"Polo\xa7ka :A,10;\r\nbegin end;\n") is True
     assert X._looks_like_text(b"\x00\x00\x08Polo\xa7ka") is False
+
+
+def test_parse_catalog_pokus():
+    import rdbparse as R
+
+    cat = R.parse_catalog((SAMPLE_DIR / "POKUS.rdb").read_bytes())
+    assert [c["name"] for c in cat] == ["FSoubor", "FSoubSif", "PMain"]
+    # TxtPos values are the absolute offsets into the paired .ttt
+    assert cat[0]["txtpos"] == 1798
+    assert cat[2]["txtpos"] == 642
+
+
+def test_decode_tfile_cataloged_pokus():
+    ttt = (SAMPLE_DIR / "POKUS.ttt").read_bytes()
+    rdb = (SAMPLE_DIR / "POKUS.rdb").read_bytes()
+    out = X.decode_tfile_cataloged(ttt, rdb)
+    chapters = sum(1 for ln in out.split(b"\n") if ln.startswith(b"### "))
+    assert chapters == 3, f"expected 3 catalog chapters, got {chapters}"
+    assert b"### FSoubor" in out
+    assert b"### PMain" in out
+    # LicNr for POKUS is 0, so pos == txtpos
+    assert b"licnr=0" in out
+
+
+def test_decode_tfile_cataloged_kabely_count():
+    ttt = (SAMPLE_DIR / "KABELY2.TTT").read_bytes()
+    rdb = (SAMPLE_DIR / "KABELY2.RDB").read_bytes()
+    out = X.decode_tfile_cataloged(ttt, rdb)
+    # All 78 member sources decoded, no blind-scan false positives
+    chapters = sum(1 for ln in out.split(b"\n") if ln.startswith(b"### "))
+    assert chapters == 78, f"expected 78 catalog chapters, got {chapters}"
+    assert b"Jmeno_Serveru" in out
+
+
+def test_rebuild_tfile_no_size_explosion():
+    ttt = (SAMPLE_DIR / "KABELY2.TTT").read_bytes()
+    rebuilt = X.rebuild_tfile(ttt)
+    # Rebuild must stay within a sane multiple of the input size
+    # (the old bug produced a ~37 MB file from a 149 KB input).
+    assert len(rebuilt) < len(ttt) * 4
+

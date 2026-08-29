@@ -33,6 +33,8 @@ import argparse
 import struct
 from pathlib import Path
 
+import rdbparse
+
 
 class DecodeError(ValueError):
     """Raised when an encoded segment is malformed."""
@@ -330,27 +332,109 @@ def encode_tfile(records: "list[bytes]", licnr: int = 0, time: int = 0) -> bytes
     return bytes(buf)
 
 
+def extract_tfile_texts(data: bytes) -> "list[bytes]":
+    """Return the decoded *text* records stored in a TFile, one item per record.
+
+    Mirrors the scan in ``decode_tfile`` (filters by ``_looks_like_text`` and
+    de-duplicates) but keeps the individual decoded records separate so they can
+    be re-packed, instead of concatenating them into one blob.
+    """
+    out = []
+    seen = set()
+    for pos in range(512, len(data) - 4):
+        length = struct.unpack_from("<H", data, pos)[0]
+        if length < 6 or length > 9000:
+            continue
+        raw = _reassemble_tfile_record(data, pos)
+        if raw is None or len(raw) < 6:
+            continue
+        candidates = []
+        if args_format_is_x:
+            try:
+                candidates.append(decode_x_segment(struct.pack("<H", length) + raw))
+            except DecodeError:
+                pass
+        if args_format_is_xor_aa:
+            candidates.append(decode_xor_aa(raw))
+        candidates.append(raw)
+        for dec in candidates:
+            if _looks_like_text(dec) and dec not in seen:
+                seen.add(dec)
+                out.append(dec)
+                break
+    return out
+
+
 def rebuild_tfile(data: bytes, licnr: int = 0) -> bytes:
     """Re-emit a ``.ttt`` as a loadable *unencrypted* TFile.
 
-    Each stored record is decoded (XEncode / XOR-AA / verbatim) to its source
-    text and re-stored XOR-AA encoded with ``LicNr=0``; FAND's ``Code`` then
-    reverses XOR-AA on load, yielding the plaintext source. The page0 copy-
-    protection scramble is reproduced (WrPrefix); full FAND-load verification
-    still requires DOSBox.
+    Only genuine FAND source-text records (validated by ``_looks_like_text``)
+    are kept; garbage/false-positive positions are dropped. Each stored record
+    is decoded (XEncode / XOR-AA / verbatim) to its source text and re-stored
+    XOR-AA encoded with ``LicNr=0``; FAND's ``Code`` then reverses XOR-AA on
+    load, yielding the plaintext source. The page0 copy-protection scramble is
+    reproduced (WrPrefix); full FAND-load verification still requires DOSBox.
     """
     global args_format_is_x, args_format_is_xor_aa
     saved_x, saved_aa = args_format_is_x, args_format_is_xor_aa
     args_format_is_x = True
     args_format_is_xor_aa = True
     try:
-        out = []
-        for raw in extract_tfile_records(data):
-            dec = _decode_segment_best(raw)
-            if dec is None:
-                dec = raw
-            out.append(decode_xor_aa(dec))
+        texts = extract_tfile_texts(data)
+        out = [decode_xor_aa(t) for t in texts]
         return encode_tfile(out, licnr=licnr)
+    finally:
+        args_format_is_x, args_format_is_xor_aa = saved_x, saved_aa
+
+
+def decode_tfile_cataloged(ttt: bytes, rdb: bytes) -> bytes:
+    """Decode a FAND TFile using the paired ``.rdb`` member catalog.
+
+    The catalog (``.rdb``) lists every member file/table together with its
+    absolute source-text position (``txtpos``) inside the ``.ttt``. Subtracting
+    the ``.ttt``'s ``LicNr`` (header @458) yields the exact LongStr start; each
+    record is reassembled across 512-byte pages and decoded with the XEncode /
+    XOR-AA / verbatim transforms. This is exact and avoids the false positives
+    of the blind ``tfile`` scan, since every offset comes from the real catalog.
+    """
+    global args_format_is_x, args_format_is_xor_aa
+    saved_x, saved_aa = args_format_is_x, args_format_is_xor_aa
+    args_format_is_x = True
+    args_format_is_xor_aa = True
+    try:
+        licnr = struct.unpack_from("<H", ttt, 458)[0]
+        cat = rdbparse.parse_catalog(rdb)
+        out = []
+        for entry in cat:
+            pos = entry["txtpos"] - licnr
+            if pos < 512 or pos >= len(ttt):
+                continue
+            length = struct.unpack_from("<H", ttt, pos)[0]
+            raw = _reassemble_tfile_record(ttt, pos)
+            if raw is None or len(raw) < 2:
+                continue
+            cands = []
+            try:
+                cands.append(decode_x_segment(struct.pack("<H", length) + raw))
+            except DecodeError:
+                pass
+            cands.append(decode_xor_aa(raw))
+            cands.append(raw)
+            dec = None
+            for c in cands:
+                if _looks_like_text(c):
+                    dec = c
+                    break
+            if dec is None:
+                dec = cands[-1]
+            name = entry["name"] or f"pos{pos}"
+            out.append(
+                f"### {name}  (txtpos={entry['txtpos']} licnr={licnr} "
+                f"pos={pos} len={len(dec)})\n".encode("utf-8")
+            )
+            out.append(dec)
+            out.append(b"\n")
+        return b"".join(out)
     finally:
         args_format_is_x, args_format_is_xor_aa = saved_x, saved_aa
 
@@ -403,7 +487,7 @@ def _main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("segment", "full", "tfile", "wtfile", "rtfile"),
+        choices=("segment", "full", "tfile", "wtfile", "rtfile", "tcat"),
         default="segment",
         help=(
             "decoding mode (default: segment). "
@@ -415,7 +499,21 @@ def _main() -> int:
             "are joined with a newline. "
             "'tfile' treats the input as a FAND TFile container (512-byte pages): "
             "it reassembles each LongStr record across pages and decodes it with "
-            "the XEncode and/or XOR 0xAA transforms, keeping readable source text"
+            "the XEncode and/or XOR 0xAA transforms, keeping readable source text. "
+            "'tcat' (catalog-driven) requires --rdb: it decodes the .ttt using the "
+            "exact record offsets from the paired .rdb member catalog (TxtPos - "
+            "LicNr), which is exact and free of false positives. "
+            "'wtfile' re-emits the .ttt as a loadable unencrypted TFile. "
+            "'rtfile' dumps the raw (still-encoded) LongStr records for inspection."
+        ),
+    )
+    parser.add_argument(
+        "--rdb",
+        type=Path,
+        default=None,
+        help=(
+            "paired .rdb member catalog, required by --mode tcat. The catalog "
+            "supplies the exact source-text offsets (TxtPos) for each record."
         ),
     )
     args = parser.parse_args()
@@ -439,6 +537,11 @@ def _main() -> int:
     elif args.mode == "wtfile":
         # Re-emit a loadable, unencrypted .ttt (records re-stored XOR-AA).
         decoded = rebuild_tfile(data)
+    elif args.mode == "tcat":
+        if args.rdb is None:
+            parser.error("--mode tcat requires --rdb <catalog.rdb>")
+        rdb_data = args.rdb.read_bytes()
+        decoded = decode_tfile_cataloged(data, rdb_data)
     elif args.mode == "segment":
         # Treat the entire file as a single encoded segment; fall back to raw
         decoded = _decode_segment_best(data)

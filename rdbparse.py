@@ -73,6 +73,32 @@ def parse_rdb(data: bytes) -> "tuple[int, int, list[bytes]]":
     return nrecs, reclen, records
 
 
+def parse_catalog(data: bytes) -> "list[dict]":
+    """Return the member-file catalog from a FAND ``.rdb`` data file.
+
+    For the sample applications each 24-byte record is a condensed catalog
+    entry describing one member file/table of the application:
+
+        offset 0-1   (u16)  typ      -- 0 = program (PMain), else data table
+        offset 7-18  (12)   name     -- member file/table name (CP852)
+        offset 20-23 (u32)  txtpos   -- absolute byte position in the paired
+                                       ``.ttt`` (before the LicNr correction)
+
+    The position of the source text inside the ``.ttt`` is ``txtpos - LicNr``
+    where ``LicNr`` lives in the ``.ttt`` header at offset 458.
+    """
+    _, _, records = parse_rdb(data)
+    cat = []
+    for rec in records:
+        if len(rec) < 24:
+            continue
+        typ = struct.unpack_from("<H", rec, 0)[0]
+        name = _record_name(rec)
+        txtpos = struct.unpack_from("<I", rec, 20)[0]
+        cat.append({"typ": typ, "name": name, "txtpos": txtpos})
+    return cat
+
+
 def _record_name(rec: bytes) -> "str | None":
     """Best-effort extraction of a 12-byte name field at offset 7."""
     if len(rec) < 19:
