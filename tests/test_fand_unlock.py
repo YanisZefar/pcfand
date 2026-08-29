@@ -111,10 +111,10 @@ class TestFieldDecoders(unittest.TestCase):
         # REAL48: exp byte = floor(log2(serial)) + 129, mantissa normalized
         import math
         e = serial.bit_length() - 1 + 129
-        # mantissa = (serial / 2^(e-129) - 1) * 2^39, packed big-endian in bytes 1..5
+        # mantissa = (serial / 2^(e-129) - 1) * 2^39, packed little-endian in bytes 1..5
         frac = serial / (2 ** (e - 129)) - 1.0
         mant = int(round(frac * (2 ** 39))) & 0x7FFFFFFFFF
-        b = bytes([e]) + mant.to_bytes(5, "big")
+        b = bytes([e]) + mant.to_bytes(5, "little")
         f = {"type": "D", "M": 0, "L": 0, "nbytes": 6, "off": 0, "name": "x"}
         self.assertEqual(F._decode_field(b, f), "1995-06-15")
 
@@ -159,7 +159,7 @@ class TestFieldDecoders(unittest.TestCase):
             e = exp + 129
             frac = val / (2 ** exp) - 1.0
             mant = int(round(frac * (2 ** 39))) & 0x7FFFFFFFFF
-            return bytes([e]) + mant.to_bytes(5, "big")
+            return bytes([e]) + mant.to_bytes(5, "little")
 
         f = {"type": "D", "M": 0, "L": 0, "nbytes": 6, "off": 0, "name": "x"}
         # čisté datum (zlomek 0) -> bez času
@@ -167,6 +167,15 @@ class TestFieldDecoders(unittest.TestCase):
         # datum + poledne (zlomek 0.5) -> čas se zachová
         self.assertEqual(F._decode_field(real48(728459.5), f),
                          "1995-06-15 12:00:00")
+
+    def test_tp_real_little_endian_mantissa(self):
+        # REGRESE: FAND uklada mantisu REAL48 little-endian. Bajty
+        # 0x94 00 00 00 0x5b 0x32 (prvni Datum v DATA.000) musi dat
+        # ~rok 2001, ne rok 1434 (big-endian chyba -> prazdny datum).
+        b = bytes([0x94, 0x00, 0x00, 0x00, 0x5b, 0x32])
+        val = F._tp_real(b)
+        self.assertAlmostEqual(val, 730544.0)
+        self.assertEqual(F.fand_serial_to_date(int(val)), (2001, 2, 28))
 
 
 class TestSchemaKey(unittest.TestCase):

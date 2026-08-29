@@ -173,8 +173,11 @@ def _bcd_to_int(b):
 
 def _tp_real(b):
     """Decode a 6-byte Turbo Pascal REAL48 into a Python float.
+
     Byte 0 = exponent (biased by 129); bytes 1-5 = 40-bit mantissa with the
-    sign in the high bit of byte 1; the implicit leading 1 is at bit 39."""
+    sign in the high bit of byte 1; the implicit leading 1 is at bit 39. FAND
+    stores the five mantissa bytes little-endian on disk (confirmed against
+    real KABELY2 data, where big-endian yields no in-range dates)."""
     if len(b) != 6:
         return 0.0
     e = b[0]
@@ -182,7 +185,7 @@ def _tp_real(b):
         return 0.0
     exp = e - 129
     sign = -1.0 if (b[1] & 0x80) else 1.0
-    mant = int.from_bytes(b[1:6], "big") & 0x7FFFFFFFFF
+    mant = int.from_bytes(b[1:6], "little") & 0x7FFFFFFFFF
     return sign * (1.0 + mant / 2.0 ** 39) * 2.0 ** exp
 
 

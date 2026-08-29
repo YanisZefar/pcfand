@@ -128,8 +128,8 @@ def test_write_chapters(tmp_path):
         "002_PMain.txt",
     ]
     # Each member file keeps its original CP852 source bytes.
-    assert (outdir / "002_PMAIN.txt").read_bytes()
-    assert "PMAIN" in (outdir / "_index.txt").read_text()
+    assert (outdir / "002_PMain.txt").read_bytes()
+    assert "PMain" in (outdir / "_index.txt").read_text()
 
 
 def test_rebuild_tfile_cataloged_roundtrip():
