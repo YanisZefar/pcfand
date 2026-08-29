@@ -219,6 +219,142 @@ def decode_tfile(data: bytes) -> bytes:
     return bytes(out)
 
 
+def _bp7_randstep() -> int:
+    """One step of Borland Pascal 7's linear-congruential ``RandSeed`` LCG."""
+    global args_randseed
+    args_randseed = (args_randseed * 134775813 + 1) & 0xFFFFFFFF
+    return (args_randseed >> 16) & 0x7FFF
+
+
+def _bp7_random(n: int) -> int:
+    """``Random(n)`` from BP7: returns a value in ``0..n-1``."""
+    return (_bp7_randstep() * n) // 32768
+
+
+def extract_tfile_records(data: bytes) -> "list[bytes]":
+    """Return the raw (still-encoded) LongStr payloads stored in a TFile.
+
+    Mirrors the scan used by ``decode_tfile`` but keeps the stored bytes
+    verbatim (so they can be re-packed unchanged).
+    """
+    out = []
+    seen = set()
+    for pos in range(512, len(data) - 4):
+        length = struct.unpack_from("<H", data, pos)[0]
+        if length < 6 or length > 65000:
+            continue
+        raw = _reassemble_tfile_record(data, pos)
+        if raw is None or len(raw) < 6:
+            continue
+        if raw in seen:
+            continue
+        seen.add(raw)
+        out.append(raw)
+    return out
+
+
+def _build_tfile_page0(licnr: int, mlen: int, time: int) -> bytes:
+    """Construct a valid TFile header page (TT1Page) including the WrPrefix scramble.
+
+    ``mlen`` must be the final file size (used as the RNG seed together with
+    ``time``), so callers build the record pages first and patch page0 last.
+    """
+    global args_randseed
+    T = bytearray(512)
+    struct.pack_into("<H", T, 0, 1)            # Signum
+    struct.pack_into("<H", T, 2, 0xFFFF)       # OldMaxPage
+    struct.pack_into("<I", T, 4, 512)          # FreePart (= MPageSize, valid per RdPrefix)
+    n = 0x6000 if licnr != 0 else 0x4000
+    struct.pack_into("<H", T, 11, n)           # IRec (flags)
+    struct.pack_into("<I", T, 13, 0)           # FreeRoot
+    struct.pack_into("<i", T, 17, (mlen // 512) - 1)  # MaxPage
+    T[55:59] = b"FAND"                         # Version
+    struct.pack_into("<H", T, 458, licnr & 0xFFFF)     # LicNr (empirical offset)
+    T[511] = time & 0xFF                       # Time (used by the RNG seed)
+    # WrPrefix: scramble bytes 13..510 (i.e. loop i=14..511) with Random(255).
+    args_randseed = (mlen + time) & 0xFFFFFFFF
+    for off in range(13, 511):
+        T[off] ^= _bp7_random(255)
+    return bytes(T)
+
+
+def _write_tfile_record(buf: bytearray, rec: bytes) -> None:
+    """Append one LongStr record to ``buf`` using 512-byte pages and 4-byte chains.
+
+    Layout mirrors ``_reassemble_tfile_record``: 2-byte length, then data; when a
+    record overflows a page the final 4 bytes of that page hold the absolute
+    position of the next page.
+    """
+    PAGE = 512
+    start = len(buf)
+    buf[start:start + 2] = struct.pack("<H", len(rec))
+    p = start + 2
+    remaining = len(rec)
+    src = 0
+    while remaining > 0:
+        page_start = (p // PAGE) * PAGE
+        rest = PAGE - (p - page_start)
+        if remaining > rest - 4:
+            chunk = rest - 4
+            if len(buf) < p + chunk:
+                buf.extend(b"\x00" * (p + chunk - len(buf)))
+            buf[p:p + chunk] = rec[src:src + chunk]
+            src += chunk
+            remaining -= chunk
+            p += chunk
+            ptr_pos = page_start + PAGE - 4
+            next_pos = (page_start // PAGE + 1) * PAGE
+            if len(buf) < ptr_pos + 4:
+                buf.extend(b"\x00" * (ptr_pos + 4 - len(buf)))
+            if len(buf) < next_pos:
+                buf.extend(b"\x00" * (next_pos - len(buf)))
+            struct.pack_into("<I", buf, ptr_pos, next_pos)
+            p = next_pos
+        else:
+            if len(buf) < p + remaining:
+                buf.extend(b"\x00" * (p + remaining - len(buf)))
+            buf[p:p + remaining] = rec[src:src + remaining]
+            src += remaining
+            remaining = 0
+
+
+def encode_tfile(records: "list[bytes]", licnr: int = 0, time: int = 0) -> bytes:
+    """Pack raw LongStr payloads into a loadable TFile container (``.ttt``)."""
+    buf = bytearray(512)  # page0 placeholder
+    for rec in records:
+        _write_tfile_record(buf, rec)
+    if len(buf) % 512:
+        buf.extend(b"\x00" * (512 - len(buf) % 512))
+    page0 = _build_tfile_page0(licnr, len(buf), time)
+    buf[0:512] = page0
+    return bytes(buf)
+
+
+def rebuild_tfile(data: bytes, licnr: int = 0) -> bytes:
+    """Re-emit a ``.ttt`` as a loadable *unencrypted* TFile.
+
+    Each stored record is decoded (XEncode / XOR-AA / verbatim) to its source
+    text and re-stored XOR-AA encoded with ``LicNr=0``; FAND's ``Code`` then
+    reverses XOR-AA on load, yielding the plaintext source. The page0 copy-
+    protection scramble is reproduced (WrPrefix); full FAND-load verification
+    still requires DOSBox.
+    """
+    global args_format_is_x, args_format_is_xor_aa
+    saved_x, saved_aa = args_format_is_x, args_format_is_xor_aa
+    args_format_is_x = True
+    args_format_is_xor_aa = True
+    try:
+        out = []
+        for raw in extract_tfile_records(data):
+            dec = _decode_segment_best(raw)
+            if dec is None:
+                dec = raw
+            out.append(decode_xor_aa(dec))
+        return encode_tfile(out, licnr=licnr)
+    finally:
+        args_format_is_x, args_format_is_xor_aa = saved_x, saved_aa
+
+
 def _decode_segment_best(segment: bytes) -> "bytes | None":
     """Try XEncode, then XOR-AA, then verbatim; return the first that reads as text.
 
@@ -243,6 +379,7 @@ def _decode_segment_best(segment: bytes) -> "bytes | None":
 
 args_format_is_x = False
 args_format_is_xor_aa = False
+args_randseed = 0
 
 
 def _main() -> int:
@@ -266,7 +403,7 @@ def _main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("segment", "full", "tfile"),
+        choices=("segment", "full", "tfile", "wtfile", "rtfile"),
         default="segment",
         help=(
             "decoding mode (default: segment). "
@@ -290,6 +427,18 @@ def _main() -> int:
     data = args.input.read_bytes()
     if args.mode == "tfile":
         decoded = decode_tfile(data)
+    elif args.mode == "rtfile":
+        # Extract raw (encoded) LongStr records and write one per line (hex+text).
+        recs = extract_tfile_records(data)
+        parts = []
+        for i, r in enumerate(recs):
+            parts.append(f"--- record {i} ({len(r)} bytes) ---".encode("utf-8"))
+            parts.append(r)
+            parts.append(b"")
+        decoded = b"\n".join(parts)
+    elif args.mode == "wtfile":
+        # Re-emit a loadable, unencrypted .ttt (records re-stored XOR-AA).
+        decoded = rebuild_tfile(data)
     elif args.mode == "segment":
         # Treat the entire file as a single encoded segment; fall back to raw
         decoded = _decode_segment_best(data)

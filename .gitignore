@@ -112,3 +112,7 @@ aplikace_pcfand/fand_unlock_out/decoded/POKUSSI2/PMain.txt
 # Python bytecode
 __pycache__/
 *.pyc
+
+# generated decoded outputs
+aplikace_pcfand/decoded_full/*.txt
+aplikace_pcfand/fand_unlock_out/decoded/
