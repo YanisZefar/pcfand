@@ -54,6 +54,12 @@ class TestSchemaParsing(unittest.TestCase):
 
 
 class TestFieldDecoders(unittest.TestCase):
+    def test_decode_A_plaintext(self):
+        # Nektere tabulky (napr. FZavery.x Zaver) ukladaji 'A' jako cisty
+        # plaintext; musi se vratit text, ne XOR 0xAA nesmysl.
+        self.assertEqual(F._decode_A("OŘJ SVAŘECI ŠKOLA".encode(F.CP852)),
+                         "OŘJ SVAŘECI ŠKOLA")
+
     def test_decode_A_xorAA(self):
         # A fields are stored XOR-AA encrypted (CP852 text)
         plain = "Tučková Zdeňka".encode(F.CP852)

@@ -259,11 +259,19 @@ def _serial_to_datetime(val):
 
 
 def _decode_A(b):
-    b = xorAA(b)
+    # FAND 'A' pole se koduji procedurou Code (XOR 0xAA, viz ACCESS.PAS), ale
+    # nektere tabulky je ukladaji jako cisty plaintext (napr. FZavery.x). Zkousime
+    # oboji a vracime prvni variantu, ktera da citelny text (stejne jako
+    # _decode_memo_blob). To opravuje napr. ZAVERY.Zaver, ktery je plaintextovy.
     if _is_fill(b):
         return ""
-    s = b.replace(b"\xff", b"").split(b"\x00")[0]
-    return s.decode(CP852, "replace").rstrip()
+    for cand in (b, xorAA(b)):
+        s = cand.split(b"\x00", 1)[0].decode(CP852, "replace")
+        s = s.replace("\xff", "").rstrip("\x00").rstrip()
+        if _readable_score(s) >= 0.6:
+            return s
+    s = xorAA(b).split(b"\x00", 1)[0].decode(CP852, "replace")
+    return s.replace("\xff", "").rstrip("\x00").rstrip()
 
 
 # FAND epoch for integer-mode ('8') date fields: stored = RDate_serial - FIRSTDATE.

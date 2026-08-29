@@ -39,8 +39,10 @@ je doplněk s tím, co by agent snadno přehlédl.
   `Code` = XOR `0xAA` (když `LicenseNr` šablony == 0), `XDecode` (LZ77 + rotující
   `RMask`, `ACCESS.PAS:903`) když `LicenseNr != 0`; některé tabulky ukládají memo
   jako čistý plaintext. `fand_unlock._decode_memo_blob` zkouší postupně
-  plaintext → XOR `0xAA` → `XDecode` a vrací nejčitelnější. `Heslo` a ostatní `A`
-  pole jdou přes `Code` (XOR `0xAA`) — to je správně, neměň.
+  plaintext → XOR `0xAA` → `XDecode` a vrací nejčitelnější. `Heslo` i ostatní `A`
+  pole jdou přes `fand_unlock._decode_A`, které zkouší **plaintext i XOR `0xAA`**
+  a vrací první čitelnou variantu (např. `FZavery.x.Zaver` je plaintext, `FData.x`
+  je XOR `0xAA`) — obě větve jsou správně, neměň bez ověření na vzorcích.
 - **Typ `D` (datum) nese i čas:** celočíselná část REAL48 = datumový serial (dny od
   1. 1. 0001), **zlomek dne = čas**. Viz `fand_serial_to_date` + `_serial_to_datetime`.
   Režim `'8'`: 2B signed int = serial − `FIRSTDATE` (697248 = 1. 1. 1910).
