@@ -89,8 +89,13 @@ def parse_schema_fields(text):
     fields = []
     off = 0
     for m in FIELD_RE.finditer(text or b""):
-        name = m.group(1).decode(CP852, "replace")
+        name = m.group(1).decode(CP852, "replace").strip()
         ftype = m.group(2).decode("ascii")
+        if name.lower() == "txtpos":
+            # TxtPos je katalogovy ukazatel polohy sablony v .ttt (ulozen v .rdb,
+            # ne v .000). Neni soucasti datoveho zaznamu, proto ho z vypisu
+            # poli vypustime, jinak by posunul offsety vsech dalsich poli.
+            continue
         length = m.group(3).decode("ascii") if m.group(3) else None
         L = M = 0
         if length:
@@ -113,6 +118,17 @@ def parse_schema_fields(text):
         fields.append({"name": name, "type": ftype, "L": L, "M": M,
                        "nbytes": nbytes, "off": off})
         off += nbytes
+    # FAND uklada nektere "Uloha"/prompt objekty (Fuloha, FulohaOP) v jinem
+    # fyzickem poradi, nez je v sablone: pole Typ je ulozeno HNED ZA Overit,
+    # tedy pred StText (sablona ma Overit, StText, Typ, ...). Bez tohoto
+    # prevraceni by StText a Typ ukazovaly na spatne bajty a texty byly rozbité.
+    if [f["name"].lower() for f in fields] == ["overit", "sttext", "typ", "nazev", "text"]:
+        _order = {"overit": 0, "typ": 1, "sttext": 2, "nazev": 3, "text": 4}
+        fields.sort(key=lambda f: _order[f["name"].lower()])
+        off = 0
+        for f in fields:
+            f["off"] = off
+            off += f["nbytes"]
     return fields
 
 
@@ -521,8 +537,14 @@ def convert_data_file(path, fields, t00_path=None, file_type=None,
     if not fields:
         return None
     expected = sum(f["nbytes"] for f in fields) + 1
-    has_flag = (reclen == expected)
-    if not has_flag and reclen != expected - 1:
+    if reclen == expected:
+        has_flag = True
+    elif reclen == expected - 1:
+        has_flag = False
+    elif expected < reclen <= expected + 4:
+        # flag pritomen + nekolik paddovacich bajtu na konci zaznamu
+        has_flag = True
+    else:
         return None
     data = raw[6:]
     rawdata = raw[6:]
