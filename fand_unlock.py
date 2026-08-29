@@ -275,19 +275,23 @@ def _serial_to_datetime(val):
 
 
 def _decode_A(b):
-    # FAND 'A' pole se koduji procedurou Code (XOR 0xAA, viz ACCESS.PAS), ale
-    # nektere tabulky je ukladaji jako cisty plaintext (napr. FZavery.x). Zkousime
-    # oboji a vracime prvni variantu, ktera da citelny text (stejne jako
-    # _decode_memo_blob). To opravuje napr. ZAVERY.Zaver, ktery je plaintextovy.
     if _is_fill(b):
         return ""
+    scored = []
     for cand in (b, xorAA(b)):
         s = cand.split(b"\x00", 1)[0].decode(CP852, "replace")
         s = s.replace("\xff", "").rstrip("\x00").rstrip()
         if _readable_score(s) >= 0.6:
-            return s
-    s = xorAA(b).split(b"\x00", 1)[0].decode(CP852, "replace")
-    return s.replace("\xff", "").rstrip("\x00").rstrip()
+            scored.append(s)
+    if not scored:
+        s = xorAA(b).split(b"\x00", 1)[0].decode(CP852, "replace")
+        return s.replace("\xff", "").rstrip("\x00").rstrip()
+    if len(scored) == 1:
+        return scored[0]
+    ascii_cands = [s for s in scored if all(0x20 <= ord(c) <= 0x7E for c in s)]
+    if len(ascii_cands) == 1:
+        return ascii_cands[0]
+    return scored[0]
 
 
 # FAND epoch for integer-mode ('8') date fields: stored = RDate_serial - FIRSTDATE.
@@ -505,19 +509,44 @@ def _read_t00(t00, phys):
     return _decode_memo_blob(raw)
 
 
-def _decode_T(pb, t00):
+_MEMO_PUNCT = set(" .,;:-/()'=+\"[]{}*!?%@&#")
+
+
+def _memo_quality(t):
+    good = sum(1 for c in t if c.isalnum() or c in _MEMO_PUNCT)
+    bad = len(t) - good
+    return good - 3 * bad
+
+
+def _decode_T(pb, t00, ttt=None):
     ptr = int.from_bytes(pb, "little")
     if ptr in (0, 0xAAAAAAAA):
         return ""
-    for phys in (ptr, ptr + 384):
-        txt = _read_t00(t00, phys)
-        if txt:
-            return txt
-    return ""
+    cands = []
+    for src in (t00, ttt):
+        if not src:
+            continue
+        for phys in (ptr, ptr + 384):
+            if phys < 512 or phys + 2 > len(src):
+                continue
+            blob = xdecode._reassemble_tfile_record(src, phys)
+            if blob:
+                txt = _decode_memo_blob(blob)
+                if txt:
+                    cands.append(txt)
+    if not cands:
+        return ""
+    if len(cands) == 1:
+        return cands[0]
+    # vice kandidatu (napr. .T00 i .TTT): .T00 ma prednost, pokud neni
+    # evidentne nesmysl; jinak vezmeme nejcitelnejsi.
+    if _memo_quality(cands[0]) >= 0:
+        return cands[0]
+    return max(cands, key=_memo_quality)
 
 
-def convert_data_file(path, fields, t00_path=None, file_type=None,
-                     include_deleted=False):
+def convert_data_file(path, fields, t00_path=None, ttt_path=None, file_type=None,
+                      include_deleted=False):
     """Decode a FAND data file into rows.
 
     Layout: 6-byte plaintext header (signed NRecs@0, RecLen@4) + a flat run of
@@ -552,6 +581,10 @@ def convert_data_file(path, fields, t00_path=None, file_type=None,
     if t00_path and os.path.exists(t00_path):
         with open(t00_path, "rb") as fh:
             t00 = fh.read()
+    ttt = None
+    if ttt_path and os.path.exists(ttt_path):
+        with open(ttt_path, "rb") as fh:
+            ttt = fh.read()
     rows = []
     start = 1 if has_flag else 0
     for i in range(nrecs):
@@ -566,7 +599,7 @@ def convert_data_file(path, fields, t00_path=None, file_type=None,
             o = start + f["off"]
             if f["type"] == "T":
                 pb = rawdata[base + o:base + o + f["nbytes"]]
-                row.append(_decode_T(pb, t00))
+                row.append(_decode_T(pb, t00, ttt))
             else:
                 b = rec[o:o + f["nbytes"]]
                 row.append(_decode_field(b, f, file_type))
@@ -618,7 +651,7 @@ def _schema_key(name):
 
 
 def export_data_tables(folder, schema_by_key, file_type_by_key, out_dir,
-                      include_deleted=False):
+                       include_deleted=False, ttt_by_key=None):
     """Emit one CSV per FAND data file (columns = schema, rows = .000 + .T00)."""
     tables = []
     seen = set()
@@ -640,7 +673,11 @@ def export_data_tables(folder, schema_by_key, file_type_by_key, out_dir,
                os.path.splitext(cand)[1].lower() == ".t00":
                 t00 = cand
                 break
-        rows = convert_data_file(path, fields, t00,
+        ttt = None
+        if ttt_by_key:
+            tkey = skey if skey in ttt_by_key else stem
+            ttt = ttt_by_key.get(tkey)
+        rows = convert_data_file(path, fields, t00, ttt,
                                 file_type=file_type_by_key.get(skey),
                                 include_deleted=include_deleted)
         if not rows:
@@ -673,6 +710,7 @@ def process(folder, out_root, include_deleted=False):
     data_tables = []
     schema_by_key = {}
     file_type_by_key = {}
+    schema_ttt_by_key = {}
 
     for rdb, ttt in pairs:
         app = os.path.splitext(os.path.basename(rdb))[0]
@@ -714,6 +752,8 @@ def process(folder, out_root, include_deleted=False):
                 if key not in schema_by_key:
                     schema_by_key[key] = fields
                     file_type_by_key[key] = rec["typ"]
+                    if ttt:
+                        schema_ttt_by_key[key] = ttt
                 for fi, f in enumerate(fields, 1):
                     schema_rows.append([
                         app, name, fi, f["name"], f["type"],
@@ -727,7 +767,8 @@ def process(folder, out_root, include_deleted=False):
                 f"{(' -> ' + str(len(decoded)) + 'B') if ok else ''}")
 
     data_tables = export_data_tables(folder, schema_by_key, file_type_by_key,
-                                      out_dir, include_deleted=include_deleted)
+                                      out_dir, include_deleted=include_deleted,
+                                      ttt_by_key=schema_ttt_by_key)
 
     standalone_decoded = 0
     for path in standalone:

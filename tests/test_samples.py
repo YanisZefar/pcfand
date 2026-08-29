@@ -153,3 +153,38 @@ def test_rebuild_tfile_cataloged_roundtrip():
         c["name"] for c in R.parse_catalog(new_rdb)
     ]
 
+
+def test_ulohaop_sttext_decodes_from_ttt():
+    # ULOHAOP (FulohaOP) uklada texty "uloh" (programu) do .TTT sablony, ne do
+    # .T00. _decode_T musi zkusit oba zdroje a vratit citelny text z .TTT,
+    # i kdyz .T00 na stejnem ukazateli vraci nesmysl.
+    import fand_unlock as F, struct
+
+    if not (SAMPLE_DIR / "ULOHAOP.000").exists():
+        pytest.skip("chybi ULOHAOP vzorek")
+    ttt = (SAMPLE_DIR / "HESLO.TTT").read_bytes()
+    t00 = (SAMPLE_DIR / "ULOHAOP.T00").read_bytes()
+    raw = (SAMPLE_DIR / "ULOHAOP.000").read_bytes()
+    nrecs = abs(struct.unpack_from("<i", raw, 0)[0])
+    reclen = struct.unpack_from("<H", raw, 4)[0]
+    # schéma + offset pole StText z .TTT sablony
+    for rdb, tttp in F.find_pairs(SAMPLE_DIR):
+        tb = (SAMPLE_DIR / tttp).read_bytes() if tttp else b""
+        info = F.parse_rdb(rdb)
+        licnr = F.read_licnr(tb)
+        for rec in info["records"]:
+            if F._schema_key(rec["name"]) != "ulohaop":
+                continue
+            fields = F.parse_schema_fields(
+                F.decode_chapter(tb, rec["txtpos"] - licnr))
+            st = [f for f in fields if f["name"] == "StText"][0]
+            recb = raw[6 + 1 * reclen:6 + 2 * reclen]  # rec1
+            pb = recb[1 + st["off"]:1 + st["off"] + st["nbytes"]]
+            txt = F._decode_T(pb, t00, ttt)
+            assert "program" in txt, f"StText nenacten z TTT: {txt!r}"
+            # samotny .T00 da nesmysl -> fallback na .TTT je nutny
+            only_t00 = F._decode_T(pb, t00)
+            assert "program" not in only_t00
+            return
+    pytest.fail("ULOHAOP schema nenalezeno")
+

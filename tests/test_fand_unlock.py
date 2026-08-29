@@ -68,6 +68,15 @@ class TestFieldDecoders(unittest.TestCase):
         self.assertEqual(F._decode_A(F.xorAA(b"")), "")
         self.assertEqual(F._decode_A(bytes([0x8A] * 5)), "")
 
+    def test_decode_A_short_code_prefers_ascii(self):
+        # Kratke kodove pole (napr. ZAVERY.Prio): plaintext je nahodny ne-ASCII
+        # znak (0xE1 -> 'á'/'ß'), XOR-AA da platny ASCII kod ('K'). Musi vyhrat
+        # XOR-AA varianta.
+        self.assertEqual(F._decode_A(bytes([0xE1])), "K")
+        # Proti-test: kdyz je plaintext sam platny ASCII a XOR-AA nesmysl,
+        # zustava plaintext.
+        self.assertEqual(F._decode_A("M".encode(F.CP852)), "M")
+
     def test_decode_F_bigendian(self):
         f = {"type": "F", "M": 0, "L": 0, "nbytes": 4, "off": 0, "name": "x"}
         self.assertEqual(F._decode_field(bytes([0, 0, 0, 0x24]), f), 36)
