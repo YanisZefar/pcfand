@@ -692,6 +692,52 @@ def export_data_tables(folder, schema_by_key, file_type_by_key, out_dir,
     return tables
 
 
+def _find_data_file(folder, base, ext):
+    for fn in os.listdir(folder):
+        if fn.lower() == (base.lower() + ext):
+            return os.path.join(folder, fn)
+    return None
+
+
+def emit_unlocked(folder, pairs, out_dir):
+    """Vygeneruje nezasifrovanou ('odheslovanou') verzi kazde .rdb/.ttt ulohy.
+
+    Pro kazdy par zavola xdecode.rebuild_tfile_cataloged, ktery dekoduje
+    cleny sablony a znovu ulozi XOR-AA s LicNr=0 (FAND naopak Code() vrati
+    zpet na plaintext). Vysledne .RDB/.TTT se zapisi do unlocked/<app>/ spolu
+    s kopiemi datovych souboru (.000/.t00/.x00).
+    POZN: u licencovanych aplikaci (LicNr!=0) mohou .t00 memo soubory zustat
+    v XEncode a vyzhaduji samostatne prekodovani (viz todo).
+    """
+    unlocked_dir = os.path.join(out_dir, "unlocked")
+    os.makedirs(unlocked_dir, exist_ok=True)
+    done = []
+    for rdb, ttt in pairs:
+        if not ttt or not os.path.exists(ttt):
+            continue
+        try:
+            rdb_bytes = open(rdb, "rb").read()
+            ttt_bytes = open(ttt, "rb").read()
+            new_ttt, new_rdb = xdecode.rebuild_tfile_cataloged(ttt_bytes, rdb_bytes)
+        except Exception as e:
+            print(f"  (nelze odheslit {os.path.basename(rdb)}: {e})")
+            continue
+        app = os.path.splitext(os.path.basename(rdb))[0]
+        app_dir = os.path.join(unlocked_dir, app)
+        os.makedirs(app_dir, exist_ok=True)
+        with open(os.path.join(app_dir, app + ".RDB"), "wb") as f:
+            f.write(new_rdb)
+        with open(os.path.join(app_dir, app + ".TTT"), "wb") as f:
+            f.write(new_ttt)
+        base = os.path.splitext(os.path.basename(rdb))[0].lower()
+        for ext in (".000", ".t00", ".x00"):
+            src = _find_data_file(folder, base, ext)
+            if src:
+                shutil.copy(src, os.path.join(app_dir, os.path.basename(src)))
+        done.append(app)
+    return done
+
+
 def process(folder, out_root, include_deleted=False):
     pairs = find_pairs(folder)
     paired_ttts = {os.path.abspath(t) for _, t in pairs if t}
@@ -770,6 +816,8 @@ def process(folder, out_root, include_deleted=False):
                                       out_dir, include_deleted=include_deleted,
                                       ttt_by_key=schema_ttt_by_key)
 
+    unlocked_apps = emit_unlocked(folder, pairs, out_dir)
+
     standalone_decoded = 0
     for path in standalone:
         with open(path, "rb") as fh:
@@ -796,7 +844,8 @@ def process(folder, out_root, include_deleted=False):
     print(f"Vystup: {out_dir}")
     print(f"Dekodovano kapitol: {decoded_count} | schémat: {len(schema_rows)} "
           f"| datovych tabulek: {len(data_tables)} |"
-          f" standalone .ttt/.t00: {standalone_decoded}")
+          f" standalone .ttt/.t00: {standalone_decoded} |"
+          f" odheslovano aplikaci: {len(unlocked_apps)}")
     for line in cli_lines:
         print(line)
     return out_dir
