@@ -223,6 +223,38 @@ def fand_serial_to_date(R):
     return (y, j, l)
 
 
+def _serial_to_datetime(val):
+    """Convert a FAND date serial (float) to a string.
+
+    A FAND ``D`` (datum) field is stored as a 6-byte REAL48 whose integer part
+    is the date serial (days since year 1) and whose *fractional part is the
+    time of day* (FAND's "datum a čas" keeps time in the same 6 bytes). This
+    helper therefore returns ``YYYY-MM-DD`` when the time is midnight and
+    ``YYYY-MM-DD HH:MM:SS`` whenever the fractional day is non-zero.
+    """
+    intpart = int(val)
+    ymd = fand_serial_to_date(intpart)
+    if ymd is None:
+        return None
+    frac = val - intpart
+    time_str = ""
+    total_sec = int(round(frac * 86400))
+    if total_sec >= 1:
+        h = total_sec // 3600
+        m = (total_sec % 3600) // 60
+        s = total_sec % 60
+        if s >= 60:
+            s -= 60
+            m += 1
+        if m >= 60:
+            m -= 60
+            h += 1
+        if h >= 24:
+            h -= 24
+        time_str = f" {h:02d}:{m:02d}:{s:02d}"
+    return f"{ymd[0]:04d}-{ymd[1]:02d}-{ymd[2]:02d}{time_str}"
+
+
 def _decode_A(b):
     b = xorAA(b)
     if _is_fill(b):
@@ -272,18 +304,25 @@ def _decode_D(b, file_type):
         if ymd and 1900 <= ymd[0] <= 2100:
             return f"{ymd[0]:04d}-{ymd[1]:02d}-{ymd[2]:02d}"
         return ""
-    # 'D' režim (CFile^.Typ='D'): 8-znakový řetězec 'YYYYMMDD'.
+    # 'D' režim (CFile^.Typ='D'): 8-znakový řetězec 'YYYYMMDD' (případně
+    # 14 znaků 'YYYYMMDDHHMMSS', když pole nese i čas).
     if file_type in (0x44, "D"):
         try:
             s = b.rstrip(b" \x00\xff").decode(CP852)
         except Exception:
             s = ""
+        if len(s) >= 14 and s[:14].isdigit():
+            y, mo, d, hh, mm, ss = (int(s[0:4]), int(s[4:6]), int(s[6:8]),
+                                    int(s[8:10]), int(s[10:12]), int(s[12:14]))
+            if 1900 <= y <= 2100:
+                return f"{y:04d}-{mo:02d}-{d:02d} {hh:02d}:{mm:02d}:{ss:02d}"
         if len(s) >= 8 and s[:8].isdigit():
             y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
             if 1900 <= y <= 2100:
                 return f"{y:04d}-{m:02d}-{d:02d}"
         return ""
-    # výchozí režim: REAL48 přímo = RDate_serial (dny od 1.1.0001).
+    # výchozí režim: REAL48 přímo = RDate_serial (dny od 1.1.0001); zlomek
+    # dne nese čas (viz _serial_to_datetime).
     if _is_numeric_fill(b):
         return ""
     try:
@@ -292,9 +331,11 @@ def _decode_D(b, file_type):
         return ""
     if val < 1:
         return ""
-    ymd = fand_serial_to_date(val)
-    if ymd and 1900 <= ymd[0] <= 2100:
-        return f"{ymd[0]:04d}-{ymd[1]:02d}-{ymd[2]:02d}"
+    dt = _serial_to_datetime(val)
+    if dt:
+        y = int(dt[:4])
+        if 1900 <= y <= 2100:
+            return dt
     return ""
 
 

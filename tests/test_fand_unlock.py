@@ -137,6 +137,37 @@ class TestFieldDecoders(unittest.TestCase):
         self.assertEqual(F._decode_field(b"\x00\x00\x00\x00\x00\x00\x00\x00",
                                           f, file_type=0x44), "")
 
+    def test_decode_D_modeD_with_time(self):
+        # 'D' režim dokáže nést i 14 znaků 'YYYYMMDDHHMMSS' (datum a čas)
+        f = {"type": "D", "M": 0, "L": 0, "nbytes": 14, "off": 0, "name": "x"}
+        b = b"19950615123000"
+        self.assertEqual(F._decode_field(b, f, file_type=0x44),
+                         "1995-06-15 12:30:00")
+
+    def test_serial_to_datetime(self):
+        # čisté datum (zlomek 0) -> bez času
+        self.assertEqual(F._serial_to_datetime(1.0), "0001-01-01")
+        # poledne (zlomek 0.5) -> čas se zachová
+        self.assertEqual(F._serial_to_datetime(1.5), "0001-01-01 12:00:00")
+
+    def test_decode_D_real48_with_time(self):
+        # Výchozí REAL48 větev: zlomek dne nese čas (FAND "datum a čas").
+        import math
+
+        def real48(val):
+            exp = int(math.floor(math.log2(val))) if val >= 1 else 0
+            e = exp + 129
+            frac = val / (2 ** exp) - 1.0
+            mant = int(round(frac * (2 ** 39))) & 0x7FFFFFFFFF
+            return bytes([e]) + mant.to_bytes(5, "big")
+
+        f = {"type": "D", "M": 0, "L": 0, "nbytes": 6, "off": 0, "name": "x"}
+        # čisté datum (zlomek 0) -> bez času
+        self.assertEqual(F._decode_field(real48(728459.0), f), "1995-06-15")
+        # datum + poledne (zlomek 0.5) -> čas se zachová
+        self.assertEqual(F._decode_field(real48(728459.5), f),
+                         "1995-06-15 12:00:00")
+
 
 class TestSchemaKey(unittest.TestCase):
     def test_schema_key(self):
