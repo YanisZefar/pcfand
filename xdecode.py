@@ -274,21 +274,39 @@ def _build_tfile_page0(licnr: int, mlen: int, time: int) -> bytes:
     struct.pack_into("<H", T, 458, licnr & 0xFFFF)     # LicNr (empirical offset)
     T[511] = time & 0xFF                       # Time (used by the RNG seed)
     # WrPrefix: scramble bytes 13..510 (i.e. loop i=14..511) with Random(255).
+    # The LicNr at offset 458 must survive the scramble, so we consume the RNG
+    # step for it (keeping the stream aligned with FAND's WrPrefix) but do not
+    # XOR the field, then write it back explicitly afterwards.
     args_randseed = (mlen + time) & 0xFFFFFFFF
     for off in range(13, 511):
+        if off == 458:
+            _bp7_random(255)
+            continue
         T[off] ^= _bp7_random(255)
+    struct.pack_into("<H", T, 458, licnr & 0xFFFF)
     return bytes(T)
 
 
-def _write_tfile_record(buf: bytearray, rec: bytes) -> None:
+def _write_tfile_record(buf: bytearray, rec: bytes) -> int:
     """Append one LongStr record to ``buf`` using 512-byte pages and 4-byte chains.
 
     Layout mirrors ``_reassemble_tfile_record``: 2-byte length, then data; when a
     record overflows a page the final 4 bytes of that page hold the absolute
-    position of the next page.
+    position of the next page. Returns the absolute offset where the record's
+    length prefix was written.
+
+    A record must not start so close to a page boundary that its 2-byte length
+    prefix would overlap the 4-byte continuation pointer (the last 4 bytes of the
+    page). When fewer than 6 bytes remain on the current page the whole record is
+    pushed to the next page boundary so the prefix and pointer never collide.
     """
     PAGE = 512
     start = len(buf)
+    page_rem = PAGE - (start & (PAGE - 1))
+    if page_rem < 6:
+        start = (start + PAGE - 1) & ~(PAGE - 1)
+        if len(buf) < start:
+            buf.extend(b"\x00" * (start - len(buf)))
     buf[start:start + 2] = struct.pack("<H", len(rec))
     p = start + 2
     remaining = len(rec)
@@ -318,6 +336,7 @@ def _write_tfile_record(buf: bytearray, rec: bytes) -> None:
             buf[p:p + remaining] = rec[src:src + remaining]
             src += remaining
             remaining = 0
+    return start
 
 
 def encode_tfile(records: "list[bytes]", licnr: int = 0, time: int = 0) -> bytes:
@@ -387,15 +406,14 @@ def rebuild_tfile(data: bytes, licnr: int = 0) -> bytes:
         args_format_is_x, args_format_is_xor_aa = saved_x, saved_aa
 
 
-def decode_tfile_cataloged(ttt: bytes, rdb: bytes) -> bytes:
-    """Decode a FAND TFile using the paired ``.rdb`` member catalog.
+def iter_catalog_records(ttt: bytes, rdb: bytes) -> "iter[dict]":
+    """Yield one decoded member record per ``.rdb`` catalog entry.
 
-    The catalog (``.rdb``) lists every member file/table together with its
-    absolute source-text position (``txtpos``) inside the ``.ttt``. Subtracting
-    the ``.ttt``'s ``LicNr`` (header @458) yields the exact LongStr start; each
-    record is reassembled across 512-byte pages and decoded with the XEncode /
-    XOR-AA / verbatim transforms. This is exact and avoids the false positives
-    of the blind ``tfile`` scan, since every offset comes from the real catalog.
+    For each member the catalog lists, compute its exact source position
+    (``txtpos - LicNr`` from the ``.ttt`` header @458), reassemble the LongStr
+    across 512-byte pages, and decode it with the XEncode / XOR-AA / verbatim
+    transforms. Each item is a dict: ``name``, ``txtpos``, ``licnr``, ``pos``,
+    ``length`` and ``text`` (the decoded CP852 source bytes).
     """
     global args_format_is_x, args_format_is_xor_aa
     saved_x, saved_aa = args_format_is_x, args_format_is_xor_aa
@@ -404,7 +422,6 @@ def decode_tfile_cataloged(ttt: bytes, rdb: bytes) -> bytes:
     try:
         licnr = struct.unpack_from("<H", ttt, 458)[0]
         cat = rdbparse.parse_catalog(rdb)
-        out = []
         for entry in cat:
             pos = entry["txtpos"] - licnr
             if pos < 512 or pos >= len(ttt):
@@ -413,30 +430,142 @@ def decode_tfile_cataloged(ttt: bytes, rdb: bytes) -> bytes:
             raw = _reassemble_tfile_record(ttt, pos)
             if raw is None or len(raw) < 2:
                 continue
-            cands = []
-            try:
-                cands.append(decode_x_segment(struct.pack("<H", length) + raw))
-            except DecodeError:
-                pass
-            cands.append(decode_xor_aa(raw))
-            cands.append(raw)
             dec = None
-            for c in cands:
+            for c in _record_candidates(raw, length):
                 if _looks_like_text(c):
                     dec = c
                     break
             if dec is None:
-                dec = cands[-1]
-            name = entry["name"] or f"pos{pos}"
-            out.append(
-                f"### {name}  (txtpos={entry['txtpos']} licnr={licnr} "
-                f"pos={pos} len={len(dec)})\n".encode("utf-8")
-            )
-            out.append(dec)
-            out.append(b"\n")
-        return b"".join(out)
+                dec = raw
+            yield {
+                "name": entry["name"] or f"pos{pos}",
+                "txtpos": entry["txtpos"],
+                "licnr": licnr,
+                "pos": pos,
+                "length": length,
+                "text": dec,
+            }
     finally:
         args_format_is_x, args_format_is_xor_aa = saved_x, saved_aa
+
+
+def decode_tfile_cataloged(ttt: bytes, rdb: bytes) -> bytes:
+    """Decode a FAND TFile using the paired ``.rdb`` member catalog.
+
+    Returns a single blob with one ``### name (...)`` header and the decoded
+    source text per member. For per-chapter files use ``write_chapters``.
+    """
+    out = []
+    for rec in iter_catalog_records(ttt, rdb):
+        out.append(
+            f"### {rec['name']}  (txtpos={rec['txtpos']} licnr={rec['licnr']} "
+            f"pos={rec['pos']} len={len(rec['text'])})\n".encode("utf-8")
+        )
+        out.append(rec["text"])
+        out.append(b"\n")
+    return b"".join(out)
+
+
+def write_chapters(ttt: bytes, rdb: bytes, outdir: Path) -> "list[str]":
+    """Write each catalog member to its own file inside ``outdir``.
+
+    Files are named ``NNN_sanitizedname.txt`` (zero-padded index + member name)
+    and keep the original CP852 source bytes. An ``_index.txt`` mapping is also
+    written. Returns the list of written filenames in catalog order.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    records = list(iter_catalog_records(ttt, rdb))
+    written = []
+    for i, rec in enumerate(records):
+        safe = "".join(ch if ch.isalnum() else "_" for ch in rec["name"])
+        fname = f"{i:03d}_{safe}.txt"
+        (outdir / fname).write_bytes(rec["text"])
+        written.append(fname)
+    index = "\n".join(
+        f"{f}\t{rec['name']}\tpos={rec['pos']}\tlen={len(rec['text'])}"
+        for f, rec in zip(written, records)
+    )
+    (outdir / "_index.txt").write_text(index + "\n", encoding="utf-8")
+    return written
+
+
+def rebuild_tfile_cataloged(ttt: bytes, rdb: bytes) -> "tuple[bytes, bytes]":
+    """Re-emit the ``.ttt`` as an unencrypted TFile plus a matching new ``.rdb``.
+
+    Every member record is decoded to its source text and re-stored XOR-AA
+    encoded (LicNr=0), appended sequentially into a fresh TFile container. The
+    paired ``.rdb`` is rewritten with each member's ``TxtPos`` (u32 @20) updated
+    to the new absolute position, so the new ``.ttt``/``.rdb`` pair is internally
+    consistent and loadable by FAND (which reverses XOR-AA on load). Full
+    verification still requires DOSBox.
+    """
+    global args_format_is_x, args_format_is_xor_aa
+    saved_x, saved_aa = args_format_is_x, args_format_is_xor_aa
+    args_format_is_x = True
+    args_format_is_xor_aa = True
+    try:
+        licnr = struct.unpack_from("<H", ttt, 458)[0]
+        cat = rdbparse.parse_catalog(rdb)
+        _, reclen, records = rdbparse.parse_rdb(rdb)
+        buf = bytearray(512)  # page0 placeholder
+        new_positions = []
+        for entry in cat:
+            pos = entry["txtpos"] - licnr
+            raw = _reassemble_tfile_record(ttt, pos) if 512 <= pos < len(ttt) else None
+            if raw is None:
+                new_positions.append(None)
+                continue
+            length = struct.unpack_from("<H", ttt, pos)[0]
+            dec = None
+            for c in _record_candidates(raw, length):
+                if _looks_like_text(c):
+                    dec = c
+                    break
+            # Source-text records are re-stored XOR-AA (FAND reverses Code() on
+            # load). Undecodable / binary members are kept verbatim so they
+            # round-trip byte-for-byte and FAND sees exactly the original bytes.
+            payload = decode_xor_aa(dec) if dec is not None else raw
+            start = _write_tfile_record(buf, payload)
+            new_positions.append(start)
+        if len(buf) % 512:
+            buf.extend(b"\x00" * (512 - len(buf) % 512))
+        page0 = _build_tfile_page0(0, len(buf), 0)
+        buf[0:512] = page0
+        new_ttt = bytes(buf)
+        # Rebuild the .rdb with updated TxtPos fields (LicNr in new .ttt is 0).
+        new_rdb = bytearray(rdb[:6])
+        for i, entry in enumerate(cat):
+            if i >= len(records):
+                break
+            rec = bytearray(records[i])
+            np_ = new_positions[i]
+            # Unrebuildable entries get TxtPos=0 so the loader (and our own
+            # decoder) skips them, exactly mirroring the original .rdb whose
+            # invalid positions were skipped by iter_catalog_records.
+            struct.pack_into("<I", rec, 20, np_ if np_ is not None else 0)
+            new_rdb += rec
+        return new_ttt, bytes(new_rdb)
+    finally:
+        args_format_is_x, args_format_is_xor_aa = saved_x, saved_aa
+
+
+def _record_candidates(raw: bytes, length: int) -> "list[bytes]":
+    """Decode one reassembled LongStr ``raw`` with every known transform.
+
+    Order matches what FAND does on load: first the plain XOR 0xAA ``Code()``
+    transform, then the XEncode reverse (decode_x_segment), then the raw bytes
+    (unencoded plaintext records). Trying XOR-AA first is essential so that a
+    record already stored XOR-AA (e.g. from ``wtfile``) is not mis-read as an
+    XEncode segment. Callers pick whichever yields readable source text.
+    """
+    cands = []
+    cands.append(decode_xor_aa(raw))
+    try:
+        cands.append(decode_x_segment(struct.pack("<H", length) + raw))
+    except DecodeError:
+        pass
+    cands.append(raw)
+    return cands
 
 
 def _decode_segment_best(segment: bytes) -> "bytes | None":
@@ -512,8 +641,28 @@ def _main() -> int:
         type=Path,
         default=None,
         help=(
-            "paired .rdb member catalog, required by --mode tcat. The catalog "
-            "supplies the exact source-text offsets (TxtPos) for each record."
+            "paired .rdb member catalog, required by --mode tcat and used by "
+            "--mode wtfile to regenerate a consistent .rdb. The catalog supplies "
+            "the exact source-text offsets (TxtPos) for each record."
+        ),
+    )
+    parser.add_argument(
+        "--outdir",
+        type=Path,
+        default=None,
+        help=(
+            "with --mode tcat, write each member chapter to its own file inside "
+            "this directory (NNN_name.txt) instead of (or in addition to) the "
+            "single combined output file."
+        ),
+    )
+    parser.add_argument(
+        "--rdb-out",
+        type=Path,
+        default=None,
+        help=(
+            "with --mode wtfile --rdb, path for the regenerated .rdb catalog. "
+            "Defaults to the input .ttt stem with a .rdb extension."
         ),
     )
     args = parser.parse_args()
@@ -535,12 +684,22 @@ def _main() -> int:
             parts.append(b"")
         decoded = b"\n".join(parts)
     elif args.mode == "wtfile":
-        # Re-emit a loadable, unencrypted .ttt (records re-stored XOR-AA).
+        if args.rdb is not None:
+            # Cataloged rebuild: emit a new .ttt AND a matching new .rdb.
+            rdb_data = args.rdb.read_bytes()
+            new_ttt, new_rdb = rebuild_tfile_cataloged(data, rdb_data)
+            args.output.write_bytes(new_ttt)
+            rdb_out = args.rdb_out or args.output.with_suffix(".rdb")
+            Path(rdb_out).write_bytes(new_rdb)
+            return 0
+        # Fallback: blind re-emit as a loadable, unencrypted .ttt.
         decoded = rebuild_tfile(data)
     elif args.mode == "tcat":
         if args.rdb is None:
             parser.error("--mode tcat requires --rdb <catalog.rdb>")
         rdb_data = args.rdb.read_bytes()
+        if args.outdir is not None:
+            write_chapters(data, rdb_data, args.outdir)
         decoded = decode_tfile_cataloged(data, rdb_data)
     elif args.mode == "segment":
         # Treat the entire file as a single encoded segment; fall back to raw

@@ -109,3 +109,47 @@ def test_rebuild_tfile_no_size_explosion():
     # (the old bug produced a ~37 MB file from a 149 KB input).
     assert len(rebuilt) < len(ttt) * 4
 
+
+def test_write_chapters(tmp_path):
+    ttt = (SAMPLE_DIR / "POKUS.ttt").read_bytes()
+    rdb = (SAMPLE_DIR / "POKUS.rdb").read_bytes()
+    outdir = tmp_path / "chapters"
+    written = X.write_chapters(ttt, rdb, outdir)
+    files = sorted(p.name for p in outdir.glob("*.txt"))
+    assert files == [
+        "000_FSoubor.txt",
+        "001_FSoubSif.txt",
+        "002_PMain.txt",
+        "_index.txt",
+    ], files
+    assert written == [
+        "000_FSoubor.txt",
+        "001_FSoubSif.txt",
+        "002_PMain.txt",
+    ]
+    # Each member file keeps its original CP852 source bytes.
+    assert (outdir / "002_PMAIN.txt").read_bytes()
+    assert "PMAIN" in (outdir / "_index.txt").read_text()
+
+
+def test_rebuild_tfile_cataloged_roundtrip():
+    ttt = (SAMPLE_DIR / "KABELY2.TTT").read_bytes()
+    rdb = (SAMPLE_DIR / "KABELY2.RDB").read_bytes()
+    new_ttt, new_rdb = X.rebuild_tfile_cataloged(ttt, rdb)
+
+    def bodies(blob):
+        return b"\n".join(
+            ln for ln in blob.split(b"\n") if not ln.startswith(b"### ")
+        )
+
+    orig = X.decode_tfile_cataloged(ttt, rdb)
+    reb = X.decode_tfile_cataloged(new_ttt, new_rdb)
+    # Every member source must survive the unencrypted rebuild unchanged.
+    assert bodies(orig) == bodies(reb)
+    # And the regenerated .rdb must list the same member names.
+    import rdbparse as R
+
+    assert [c["name"] for c in R.parse_catalog(rdb)] == [
+        c["name"] for c in R.parse_catalog(new_rdb)
+    ]
+
